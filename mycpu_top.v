@@ -2,12 +2,14 @@ module mycpu_top (
     input  wire        clk,
     input  wire        resetn,
     // inst sram interface
-    output wire        inst_sram_we,
+    output wire        inst_sram_en,      //添加指令RAM片选信号
+    output wire [ 3:0] inst_sram_we,      //改为4位的字节写使能信号
     output wire [31:0] inst_sram_addr,
     output wire [31:0] inst_sram_wdata,
     input  wire [31:0] inst_sram_rdata,
     // data sram interface
-    output wire        data_sram_we,
+    output wire        data_sram_en,      //添加数据RAM片选信号
+    output wire [ 3:0] data_sram_we,
     output wire [31:0] data_sram_addr,
     output wire [31:0] data_sram_wdata,
     input  wire [31:0] data_sram_rdata,
@@ -105,7 +107,7 @@ module mycpu_top (
   wire [31:0] ms_final_result;
 
   // 修改
-  wire        valid;  // 不知道干啥用的
+  wire        valid;  // 缓存有效信号
   assign valid = 1'b1;
   wire [31:0] final_result;
 
