@@ -1,0 +1,4 @@
+xsim.dir/
+xvlog.pb
+*.out
+*.vcd
