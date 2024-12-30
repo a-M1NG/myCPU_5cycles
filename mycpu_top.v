@@ -19,9 +19,8 @@ module mycpu_top (
     output wire [ 4:0] debug_wb_rf_wnum,
     output wire [31:0] debug_wb_rf_wdata
 );
-  reg reset;
-  always @(*)
-    reset <= ~resetn;  // 避免resetn信号的时序问题， 这里不改就会延后一个时钟周期
+  wire reset;
+  assign reset = ~resetn;
 
   wire [31:0] seq_pc;
   wire [31:0] nextpc;
@@ -108,24 +107,39 @@ module mycpu_top (
 
   // 修改
   wire        valid;  // 缓存有效信号
+  wire        IF;  // 指令取指
+  wire        ID;  // 指令译码
+  wire        EXE;  // 指令执行
+  wire        MEM;  // 存储访问
+  wire        WB;  // 写回
+  wire        pre_fetch;
+  assign pre_fetch = WB;
+  // 预取，使用的是同步指令RAM，因此在发起读命令后，需要等待一个周期才能读到数据
+  // 在IF前一个周期发起读命令
+  // 更改取指逻辑，使用nextpc作为取指地址，而不是pc
   assign valid = 1'b1;
   wire [31:0] final_result;
+  reg  [ 2:0] cycle_cnt = 3'b0;
+  reg  [31:0] IDreg;  //级间缓存
+  reg  [31:0] EXEreg;
+  reg  [31:0] MEMreg;
+  reg  [31:0] WBreg;
+  reg  [31:0] IFreg;
 
-  assign seq_pc = pc + 3'h4;
-  assign nextpc = br_taken ? br_target : seq_pc;
+  assign IF              = (cycle_cnt == 3'b0);
+  assign ID              = (cycle_cnt == 3'b1);
+  assign EXE             = (cycle_cnt == 3'd2);
+  assign MEM             = (cycle_cnt == 3'd3);
+  assign WB              = (cycle_cnt == 3'd4);
 
-  always @(posedge clk) begin
-    if (reset) begin
-      pc <= 32'h1c000000;
-    end else begin
-      pc <= nextpc;
-    end
-  end
+  assign seq_pc          = pc + 3'h4;
+  assign nextpc          = br_taken ? br_target : seq_pc;
 
-  assign inst_sram_we    = 1'b0;
-  assign inst_sram_addr  = pc;
+  assign inst_sram_en    = pre_fetch;
+  assign inst_sram_we    = 4'b0;
+  assign inst_sram_addr  = nextpc;
   assign inst_sram_wdata = 32'b0;
-  assign inst            = inst_sram_rdata;
+  assign inst            = IDreg;
 
   assign op_31_26        = inst[31:26];
   assign op_25_22        = inst[25:22];
@@ -199,10 +213,41 @@ module mycpu_top (
   assign need_si26 = inst_b | inst_bl;
   assign src2_is_4 = inst_jirl | inst_bl;
 
+  always @(posedge clk) begin
+    if (reset) begin
+      // pc <= 32'h1c000000;
+      pc <= 32'h1bfffffc; // 由于使用nextpc作为取指地址，因此pc应该是nextpc的前一个地址
+      cycle_cnt <= 3'd4;
+      IDreg <= 32'h0;
+      EXEreg <= 32'h0;
+      MEMreg <= 32'h0;
+      WBreg <= 32'h0;
+    end else begin
+
+      if (cycle_cnt == 3'b100) begin
+        cycle_cnt <= 3'b0;
+      end else begin
+        cycle_cnt <= cycle_cnt + 3'b1;
+      end
+      if (IF) IDreg <= inst_sram_rdata;
+      if (ID) MEMreg <= alu_result;
+      // if (EXE) begin //EXE阶段需要给RAM发送读写命令和地址，因此要在EXE阶段前准备好地址，不能在EXE阶段后再准备地址，否则地址会冲突（在EXE阶段末地址才改变，恰好是RAM的读写时钟上升沿）
+      //   MEMreg <= EXEreg;
+      // end
+      if (MEM) begin
+        if (res_from_mem) WBreg <= data_sram_rdata;
+        else WBreg <= alu_result;
+      end
+      if (WB) begin
+        pc <= nextpc;
+      end
+    end
+  end
+
   assign imm = src2_is_4 ? 32'h4           :
              need_si20 ? {i20[19:0], 12'b0}:
              need_ui5  ? rk[4:0]           :
-/*need_si12*/{{20{i12[11]}}, i12[11:0]} ; //needui5信号应该连接到rk[4:0]，而不是i12[11:0]
+/*need_si12*/{{20{i12[11]}}, i12[11:0]} ;
 
   assign br_offs = need_si26 ? {{4{i26[25]}}, i26[25:0], 2'b0} : {{14{i16[15]}}, i16[15:0], 2'b0};
 
@@ -224,8 +269,8 @@ module mycpu_top (
 
   assign res_from_mem = inst_ld_w;
   assign dst_is_r1 = inst_bl;
-  assign gr_we = ~inst_st_w & ~inst_beq & ~inst_bne & ~inst_b; // & ~inst_bl; // 错误：inst_bl应该写入寄存器
-  assign mem_we = inst_st_w;
+  assign gr_we = (~inst_st_w & ~inst_beq & ~inst_bne & ~inst_b) & WB;
+  assign mem_we = (inst_st_w) & EXE;  //在EXE阶段发写使能，MEM阶段写数据
   assign dest = dst_is_r1 ? 5'd1 : rd;
 
   assign rf_raddr1 = rj;
@@ -259,17 +304,17 @@ module mycpu_top (
 
   alu u_alu (
       .alu_op    (alu_op),
-      .alu_src1  (alu_src1),   // 错误：alu_src1连接到了alu_src2
+      .alu_src1  (alu_src1),
       .alu_src2  (alu_src2),
       .alu_result(alu_result)
   );
 
-  // assign data_sram_en      = (res_from_mem || mem_we) && valid;
-  assign data_sram_we      = mem_we;
-  assign data_sram_addr    = alu_result;
+  assign data_sram_en      = (res_from_mem || mem_we) && EXE;
+  assign data_sram_we      = {4{mem_we}};
+  assign data_sram_addr    = MEMreg;
   assign data_sram_wdata   = rkd_value;
 
-  assign mem_result        = data_sram_rdata;
+  assign mem_result        = WBreg;
   assign final_result      = res_from_mem ? mem_result : alu_result;
 
   assign rf_we             = gr_we;
@@ -278,7 +323,7 @@ module mycpu_top (
 
   // debug info generate
   assign debug_wb_pc       = pc;
-  assign debug_wb_rf_we    = {4{rf_we}};  // 错误：应该是rf_we
+  assign debug_wb_rf_we    = {4{rf_we}};
   assign debug_wb_rf_wnum  = dest;
   assign debug_wb_rf_wdata = final_result;
 
